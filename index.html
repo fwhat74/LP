@@ -1,0 +1,191 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Device Admin Panel</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 18px; }
+    .row { display:flex; gap:10px; flex-wrap: wrap; margin: 10px 0; }
+    input, button { padding:10px; font-size:14px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    td, th { border: 1px solid #ddd; padding: 8px; }
+    .ok { color: green; }
+    .bad { color: #b00020; }
+    .box { padding: 12px; border: 1px solid #ddd; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <h2>Device Licensing Admin</h2>
+
+  <div class="box">
+    <div id="authState"><b class="bad">Not logged in</b></div>
+    <div id="uid"></div>
+    <div class="row">
+      <button id="btnLogin">Login with Google</button>
+      <button id="btnLogout">Logout</button>
+    </div>
+  </div>
+
+  <hr/>
+
+  <div class="box">
+    <h3>Activate / Update Device</h3>
+    <div class="row">
+      <input id="deviceId" placeholder="Device ID" style="min-width:260px;">
+      <input id="days" type="number" placeholder="Valid days (e.g. 30)" style="width:180px;">
+      <input id="note" placeholder="Note (optional)" style="min-width:260px;">
+      <button id="btnActivate">Activate</button>
+      <button id="btnRevoke">Revoke</button>
+      <button id="btnDelete">Delete</button>
+    </div>
+    <div id="msg"></div>
+  </div>
+
+  <div class="box">
+    <h3>Devices</h3>
+    <button id="btnRefresh">Refresh</button>
+    <table>
+      <thead>
+        <tr>
+          <th>Device ID</th>
+          <th>Active</th>
+          <th>Expires</th>
+          <th>Note</th>
+          <th>Updated</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-app.js";
+    import {
+      getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged
+    } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-auth.js";
+    import {
+      getFirestore, doc, setDoc, deleteDoc,
+      collection, getDocs, serverTimestamp, Timestamp
+    } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-firestore.js";
+
+    // ✅ 1) Firebase console → Project settings → General → Your apps → Web app config
+    // ✅ 2) firebaseConfig yahan paste karo
+    const firebaseConfig = {
+      apiKey: "PASTE_HERE",
+      authDomain: "PASTE_HERE",
+      projectId: "PASTE_HERE",
+      storageBucket: "PASTE_HERE",
+      messagingSenderId: "PASTE_HERE",
+      appId: "PASTE_HERE"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const provider = new GoogleAuthProvider();
+
+    const $ = (id) => document.getElementById(id);
+    const msg = (t, ok=true) => $("msg").innerHTML = `<p class="${ok?'ok':'bad'}">${t}</p>`;
+
+    $("btnLogin").onclick = async () => {
+      try { await signInWithPopup(auth, provider); }
+      catch (e) { msg(e.message, false); }
+    };
+
+    $("btnLogout").onclick = async () => { await signOut(auth); };
+
+    onAuthStateChanged(auth, (user) => {
+      if (!user) {
+        $("authState").innerHTML = `<b class="bad">Not logged in</b>`;
+        $("uid").innerHTML = "";
+        return;
+      }
+      $("authState").innerHTML = `<b class="ok">Logged in:</b> ${user.email}`;
+      $("uid").innerHTML = `<small><b>UID:</b> ${user.uid} (copy this into Firestore Rules admin list)</small>`;
+    });
+
+    function requireLogin() {
+      if (!auth.currentUser) throw new Error("Please login first.");
+    }
+
+    $("btnActivate").onclick = async () => {
+      try {
+        requireLogin();
+        const deviceId = $("deviceId").value.trim();
+        const days = parseInt($("days").value || "30", 10);
+        const note = $("note").value.trim();
+
+        if (!deviceId) return msg("Device ID required", false);
+        if (!Number.isFinite(days) || days <= 0) return msg("Valid days must be > 0", false);
+
+        const expiresMs = Date.now() + days * 24 * 60 * 60 * 1000;
+        const expiresAt = Timestamp.fromMillis(expiresMs);
+
+        await setDoc(doc(db, "devices", deviceId), {
+          active: true,
+          expiresAt,
+          note,
+          revokedAt: null,
+          updatedAt: serverTimestamp(),
+          createdAt: serverTimestamp()
+        }, { merge: true });
+
+        msg(`Activated ${deviceId} for ${days} days ✅`);
+        await refresh();
+      } catch (e) { msg(e.message, false); }
+    };
+
+    $("btnRevoke").onclick = async () => {
+      try {
+        requireLogin();
+        const deviceId = $("deviceId").value.trim();
+        if (!deviceId) return msg("Device ID required", false);
+
+        await setDoc(doc(db, "devices", deviceId), {
+          active: false,
+          revokedAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        }, { merge: true });
+
+        msg(`Revoked ${deviceId} ✅`);
+        await refresh();
+      } catch (e) { msg(e.message, false); }
+    };
+
+    $("btnDelete").onclick = async () => {
+      try {
+        requireLogin();
+        const deviceId = $("deviceId").value.trim();
+        if (!deviceId) return msg("Device ID required", false);
+
+        await deleteDoc(doc(db, "devices", deviceId));
+        msg(`Deleted ${deviceId} ✅`);
+        await refresh();
+      } catch (e) { msg(e.message, false); }
+    };
+
+    $("btnRefresh").onclick = () => refresh();
+
+    async function refresh() {
+      $("rows").innerHTML = "";
+      const snap = await getDocs(collection(db, "devices"));
+      snap.forEach((d) => {
+        const v = d.data();
+        const exp = v.expiresAt?.toDate ? v.expiresAt.toDate().toLocaleString() : "-";
+        const upd = v.updatedAt?.toDate ? v.updatedAt.toDate().toLocaleString() : "-";
+        $("rows").innerHTML += `
+          <tr>
+            <td>${d.id}</td>
+            <td>${v.active ? "✅" : "❌"}</td>
+            <td>${exp}</td>
+            <td>${(v.note||"")}</td>
+            <td>${upd}</td>
+          </tr>`;
+      });
+    }
+
+    setTimeout(() => refresh().catch(()=>{}), 800);
+  </script>
+</body>
+</html>
